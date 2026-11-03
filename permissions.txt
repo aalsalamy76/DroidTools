@@ -1,0 +1,3 @@
+package: com.alsalamy.droidtools
+permission: com.alsalamy.droidtools.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION
+uses-permission: name='com.alsalamy.droidtools.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'
