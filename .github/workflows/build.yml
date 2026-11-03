@@ -1,0 +1,208 @@
+name: Build & tests
+
+on:
+  push:
+    branches-ignore:
+      - ci-results
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ui_tests:
+        description: "Lancer aussi les tests d'interface sur émulateur (plus long)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Compilation, tests unitaires, lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      # Écriture limitée à la publication de l'APK (Releases) et du résumé (branche « ci-results »).
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Le dépôt peut ne contenir que l'archive DroidTools.zip (envoi depuis un téléphone) :
+      # elle est alors extraite ici, sans rien modifier dans le dépôt.
+      - name: Préparer les sources
+        run: |
+          if [ ! -f gradlew ] && [ -f DroidTools.zip ]; then
+            unzip -q -o DroidTools.zip -d "$RUNNER_TEMP/src"
+            if [ -d "$RUNNER_TEMP/src/DroidTools" ]; then cp -a "$RUNNER_TEMP/src/DroidTools/." .; else cp -a "$RUNNER_TEMP/src/." .; fi
+            echo "Sources extraites de DroidTools.zip"
+          fi
+          if [ ! -f gradlew ]; then
+            echo "::error::gradlew introuvable : envoyez le projet ou DroidTools.zip à la racine du dépôt."
+            exit 1
+          fi
+          # Un envoi par l'interface web de GitHub perd le bit exécutable.
+          chmod +x gradlew scripts/*.sh
+          mkdir -p build/ci
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # Valide aussi l'intégrité de gradle-wrapper.jar (somme connue d'une version officielle de Gradle).
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Plateforme Android 37
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37" || echo "Installation laissée à AGP"
+
+      - name: Recherche de secrets
+        run: ./scripts/check-secrets.sh
+
+      - name: Politique de confidentialité intégrée identique à PRIVACY.md
+        run: cmp PRIVACY.md app/src/main/assets/privacy_policy.md
+
+      - name: Tests unitaires (moteur + application)
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon --stacktrace :engine:test :app:testDebugUnitTest 2>&1 | tee build/ci/1-tests.log
+
+      - name: Compilation de l'APK de débogage
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon --stacktrace :app:assembleDebug 2>&1 | tee build/ci/2-assemble-debug.log
+
+      # L'APK est publié dans « Releases » : téléchargeable directement en .apk, sans archive à extraire.
+      - name: Publier l'APK dans Releases
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(grep -oE 'versionName = "[^"]+"' app/build.gradle.kts | cut -d'"' -f2)
+          cp app/build/outputs/apk/debug/app-debug.apk "DroidTools-${VERSION}-debug.apk"
+          gh release delete apk-debug --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh release create apk-debug "DroidTools-${VERSION}-debug.apk" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "DroidTools ${VERSION} (build de test n° ${{ github.run_number }})" \
+            --notes "APK de débogage compilé par GitHub Actions. Pour tester l'application : non signé pour le Play Store."
+
+      - name: Compilation release (R8 + lint bloquant)
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon --stacktrace :app:assembleRelease 2>&1 | tee build/ci/3-assemble-release.log
+
+      - name: Lint
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon :app:lintDebug 2>&1 | tee build/ci/4-lint.log
+
+      - name: Inventaire des dépendances et des permissions
+        if: always()
+        run: |
+          ./gradlew --no-daemon -q :app:dependencies --configuration releaseRuntimeClasspath > build/ci/dependencies-release.txt 2>&1 || true
+          AAPT2=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)aapt2
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          if [ -f "$APK" ]; then
+            "$AAPT2" dump permissions "$APK" > build/ci/permissions.txt || true
+            "$AAPT2" dump badging "$APK" | head -20 > build/ci/badging.txt || true
+            sha256sum "$APK" > build/ci/apk-sha256.txt
+          fi
+          sha256sum ~/.gradle/wrapper/dists/gradle-*-bin/*/gradle-*-bin.zip > build/ci/gradle-distribution-sha256.txt 2>/dev/null || true
+          cp app/build/reports/lint-results-*.txt build/ci/ 2>/dev/null || true
+
+      - name: Résumé des erreurs
+        if: always()
+        run: |
+          grep -h -B1 -A3 -E "^e: |What went wrong|FAILED|^> Task .* FAILED|Lint found|error:" build/ci/*.log 2>/dev/null \
+            | sed "s|file://$GITHUB_WORKSPACE/||g; s|$GITHUB_WORKSPACE/||g" | head -400 > build/ci/errors.txt || true
+          {
+            echo "## Erreurs"
+            echo '```'
+            head -120 build/ci/errors.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -h -E "^e: " build/ci/*.log 2>/dev/null | sed "s|file://$GITHUB_WORKSPACE/||g" | head -10 \
+            | while IFS= read -r line; do echo "::error::${line#e: }"; done
+
+      - name: Publier le résumé sur la branche ci-results
+        if: always() && github.event_name != 'pull_request'
+        run: |
+          out="$RUNNER_TEMP/results"
+          mkdir -p "$out"
+          cp build/ci/*.txt "$out/" 2>/dev/null || true
+          for f in build/ci/*.log; do [ -f "$f" ] && tail -n 400 "$f" > "$out/$(basename "$f")"; done
+          echo "run=${{ github.run_id }} commit=${{ github.sha }} statut=${{ job.status }}" > "$out/STATUS.txt"
+          cd "$out"
+          git init -q -b ci-results
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Résultats CI ${{ github.run_id }} (${{ job.status }})"
+          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ci-results
+
+      - name: APK de débogage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DroidTools-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+
+      - name: Rapports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapports
+          path: |
+            build/ci/
+            engine/build/reports/
+            engine/build/test-results/
+            app/build/reports/
+            app/build/test-results/
+          if-no-files-found: warn
+
+  ui-tests:
+    name: Tests d'interface (émulateur)
+    if: github.event_name == 'workflow_dispatch' && inputs.ui_tests
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Préparer les sources
+        run: |
+          if [ ! -f gradlew ] && [ -f DroidTools.zip ]; then
+            unzip -q -o DroidTools.zip -d "$RUNNER_TEMP/src"
+            if [ -d "$RUNNER_TEMP/src/DroidTools" ]; then cp -a "$RUNNER_TEMP/src/DroidTools/." .; else cp -a "$RUNNER_TEMP/src/." .; fi
+          fi
+          chmod +x gradlew
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Accélération KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Tests instrumentés
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          script: ./gradlew --no-daemon :app:connectedDebugAndroidTest
+      - name: Rapports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapports-ui
+          path: app/build/reports/androidTests/
+          if-no-files-found: warn
